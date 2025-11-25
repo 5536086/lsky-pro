@@ -52,8 +52,8 @@ use League\Flysystem\FilesystemException;
 use League\Flysystem\Ftp\FtpAdapter;
 use League\Flysystem\Ftp\FtpConnectionOptions;
 use League\Flysystem\Local\LocalFilesystemAdapter;
-use League\Flysystem\PhpseclibV2\SftpAdapter;
-use League\Flysystem\PhpseclibV2\SftpConnectionProvider;
+use League\Flysystem\PhpseclibV3\SftpAdapter;
+use League\Flysystem\PhpseclibV3\SftpConnectionProvider;
 use League\Flysystem\WebDAV\WebDAVAdapter;
 use Overtrue\Flysystem\Cos\CosAdapter;
 use Overtrue\Flysystem\Qiniu\QiniuAdapter;
@@ -151,8 +151,8 @@ class ImageService
         // 上传频率限制
         $this->rateLimiter($configs, $request);
 
-        // 图片处理，跳过 ico 于 gif
-        if (! in_array($extension, ['ico', 'gif'])) {
+        // 图片处理，跳过 ico gif svg
+        if (! in_array($extension, ['ico', 'gif', 'svg'])) {
             // 图片保存质量与格式
             $quality = $configs->get(GroupConfigKey::ImageSaveQuality, 75);
             $format = $configs->get(GroupConfigKey::ImageSaveFormat);
@@ -160,7 +160,7 @@ class ImageService
                 // 获取拓展名，判断是否需要转换
                 $format = $format ?: $extension;
                 $filename = Str::replaceLast($extension, $format, $file->getClientOriginalName());
-                $handleImage = InterventionImage::make($file)->save($format, $quality);
+                $handleImage = InterventionImage::make($file)->save('tmp_' . md5_file($file->getRealPath()), $quality);
                 $file = new UploadedFile($handleImage->basePath(), $filename, $handleImage->mime());
                 // 重新设置拓展名
                 $extension = $format;
@@ -245,8 +245,8 @@ class ImageService
             throw new UploadException('图片记录保存失败');
         }
 
-        // 图片检测，跳过 tif、ico 以及 psd 格式
-        if ($configs->get(GroupConfigKey::IsEnableScan) && ! in_array($extension, ['psd', 'ico', 'tif'])) {
+        // 图片检测，跳过 tif、ico、psd、svg 格式
+        if ($configs->get(GroupConfigKey::IsEnableScan) && ! in_array($extension, ['psd', 'ico', 'tif', 'svg'])) {
             $scanConfigs = $configs->get(GroupConfigKey::ScanConfigs);
             if ($this->scan(
                 driver: $scanConfigs['driver'],
@@ -266,8 +266,10 @@ class ImageService
             }
         }
 
-        // 生成缩略图
         $this->makeThumbnail($image, $file);
+
+        // 上传完成后删除临时文件
+        unlink($file->getPathname());
 
         return $image;
     }
@@ -338,11 +340,12 @@ class ImageService
                     'timeout' => 30,
                 ]),
             ),
-            StrategyKey::Webdav => new WebDAVAdapter(new Client([
+            StrategyKey::Webdav => new WebDAVAdapter(new Client(([
                 'baseUri' => $configs->get(WebDavOption::BaseUri),
                 'userName' => $configs->get(WebDavOption::Username),
-                'password' => $configs->get(WebDavOption::Password)
-            ])),
+                'password' => $configs->get(WebDavOption::Password),
+                'authType' => (int)$configs->get(WebDavOption::AuthType),
+            ])), $configs->get(WebDavOption::Prefix) ?: ''),
             StrategyKey::Minio => new AwsS3V3Adapter(
                 client: new S3Client([
                     'credentials' => [
@@ -554,21 +557,26 @@ class ImageService
                     @mkdir(dirname($pathname));
                 }
 
-                @ini_set('memory_limit', '512M');
+                // 生成缩略图，svg等格式本身体积足够小且网页原生支持(比生成的png缩略图还小)，不用生成缩略图，直接复制文件
+                if($image->extension ==='svg') {
+                    copy($data->getPathname(), $pathname);
+                }else{
+                    @ini_set('memory_limit', '512M');
 
-                $img = InterventionImage::make($data);
+                    $img = InterventionImage::make($data);
 
-                $width = $w = $image->width;
-                $height = $h = $image->height;
+                    $width = $w = $image->width;
+                    $height = $h = $image->height;
 
-                if ($w > $max && $h > $max) {
-                    $scale = min($max / $w, $max / $h);
-                    $width  = (int)($w * $scale);
-                    $height = (int)($h * $scale);
+                    if ($w > $max && $h > $max) {
+                        $scale = min($max / $w, $max / $h);
+                        $width  = (int)($w * $scale);
+                        $height = (int)($h * $scale);
+                    }
+
+                    $img->fit($width, $height, fn($constraint) => $constraint->upsize())->encode('png', 60)->save($pathname);
+                    $img->destroy();
                 }
-
-                $img->fit($width, $height, fn($constraint) => $constraint->upsize())->encode('png', 60)->save($pathname);
-                $img->destroy();
             } catch (\Throwable $e) {
                 Utils::e($e, '生成缩略图时出现异常');
             }
